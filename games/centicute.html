@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Centi-Cute</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0912;overflow:hidden;font-family:system-ui,"Segoe UI",Arial,sans-serif}
+  body{display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none}
+  #wrap{position:relative;flex:none;width:min(100vw,calc(100vh*4/3));aspect-ratio:4/3}
+  canvas{width:100%;height:100%;display:block;border-radius:14px;box-shadow:0 0 0 2px rgba(255,255,255,.08),0 30px 80px rgba(0,0,0,.6);cursor:crosshair}
+  #help{position:fixed;bottom:6px;left:0;right:0;text-align:center;color:#7d7d9c;font-size:12px;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="800" height="600"></canvas></div>
+<div id="help">Arrows/WASD move · Space or click shoot · Mouse seeks pointer · P pause · M music · N sfx</div>
+<script>
+(() => {
+'use strict';
+// ---------- constants & helpers ----------
+const W = 800, H = 600, CELL = 25, COLS = 32, ROWS = 24;
+const SEG = 15;                       // distance between centipede segments
+const cv = document.getElementById('c');
+const g = cv.getContext('2d');
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+const hx = h => { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
+const rgb = (c, a) => a === undefined
+  ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`
+  : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const mixC = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+
+// ---------- stage palettes (design-forward, one per stage, cycled) ----------
+const PALS = [
+  { name: 'BUBBLEGUM DUSK', bgA: '#2a0f2e', bgB: '#7a1f5c', grid: '#ff7ac8', ac: '#ffd1f0',
+    head: '#fff6a6', body: '#ff6fb1', body2: '#ffa9d6', mush: ['#ffe066', '#ffb347', '#ff8fab', '#c77dff'],
+    ship: '#8ef5ff', spider: '#b5ff7a' },
+  { name: 'MINT ARCADE', bgA: '#06231f', bgB: '#0f5a4e', grid: '#5dffc9', ac: '#c8fff0',
+    head: '#ffffff', body: '#38e8a8', body2: '#9dffd6', mush: ['#ffd166', '#06d6a0', '#ef476f', '#118ab2'],
+    ship: '#ffe066', spider: '#ff8fab' },
+  { name: 'TANGERINE POP', bgA: '#2b1200', bgB: '#a34a00', grid: '#ffb13b', ac: '#fff0c2',
+    head: '#fffbe0', body: '#ff7a3d', body2: '#ffc089', mush: ['#8ef5ff', '#c77dff', '#ffe066', '#ff6f91'],
+    ship: '#7cf0ff', spider: '#e0ff6b' },
+  { name: 'ULTRAVIOLET ICE', bgA: '#0b0622', bgB: '#3b1d8f', grid: '#8f7bff', ac: '#d6ccff',
+    head: '#e9fbff', body: '#7b5cff', body2: '#b6a6ff', mush: ['#7ef0ff', '#ff8ad8', '#fff07a', '#7bffa0'],
+    ship: '#ffd6f5', spider: '#7bffa0' },
+  { name: 'SAKURA MATCHA', bgA: '#f2e6f0', bgB: '#c9e8c0', grid: '#7aa86b', ac: '#ff5c8a',
+    head: '#ffffff', body: '#ff8fb8', body2: '#c9a0ff', mush: ['#ffb3c7', '#9be5a1', '#ffe38a', '#a7c7ff'],
+    ship: '#3b7d4f', spider: '#ff5c8a' }
+];
+// current (animated) colours, lerped toward the active palette
+const cur = {};
+const keysOfPal = ['bgA', 'bgB', 'grid', 'ac'];
+for (const k of keysOfPal) cur[k] = hx(PALS[0][k]);
+
+// ---------- audio: bfxr-style synth (WebAudio, no files) ----------
+let AC = null, master = null, sfxOn = true, musOn = false;
+function ctx() {
+  if (!AC) {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain();
+    master.gain.value = 0.45;
+    master.connect(AC.destination);
+  }
+  if (AC.state === 'suspended') AC.resume();
+  return AC;
+}
+// p: {w, f, f2, t, v, a, vib, vibR, at}
+function tone(p) {
+  if (!sfxOn) return;
+  const c = ctx();
+  const now = p.at !== undefined ? p.at : c.currentTime;
+  const o = c.createOscillator();
+  o.type = p.w || 'square';
+  o.frequency.setValueAtTime(p.f, now);
+  o.frequency.exponentialRampToValueAtTime(Math.max(30, p.f2 === undefined ? p.f : p.f2), now + p.t);
+  if (p.vib) {
+    const l = c.createOscillator(), lg = c.createGain();
+    l.frequency.value = p.vibR || 6; lg.gain.value = p.vib;
+    l.connect(lg); lg.connect(o.frequency);
+    l.start(now); l.stop(now + p.t);
+  }
+  const gn = c.createGain();
+  gn.gain.setValueAtTime(0.0001, now);
+  gn.gain.exponentialRampToValueAtTime(p.v || 0.3, now + (p.a || 0.004));
+  gn.gain.exponentialRampToValueAtTime(0.0001, now + p.t);
+  o.connect(gn); gn.connect(master);
+  o.start(now); o.stop(now + p.t + 0.03);
+}
+// filtered noise burst: {t, f, f2, ft, v, k}
+function noise(p) {
+  if (!sfxOn) return;
+  const c = ctx();
+  const now = c.currentTime;
+  const len = Math.floor(c.sampleRate * p.t);
+  const buf = c.createBuffer(1, len, c.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, p.k || 2);
+  const s = c.createBufferSource(); s.buffer = buf;
+  const fl = c.createBiquadFilter();
+  fl.type = p.ft || 'lowpass';
+  fl.frequency.setValueAtTime(p.f || 2000, now);
+  fl.frequency.exponentialRampToValueAtTime(Math.max(40, p.f2 || 200), now + p.t);
+  const gn = c.createGain(); gn.gain.value = p.v || 0.3;
+  s.connect(fl); fl.connect(gn); gn.connect(master);
+  s.start(now);
+}
+// bfxr-style presets (parameters chosen by hand in the same spirit as bfxr's presets)
+const SFX = {
+  shoot:  () => tone({ w: 'square', f: 1600, f2: 260, t: 0.12, v: 0.16 }),
+  hit:    () => { noise({ t: 0.09, f: 3500, f2: 500, v: 0.35 }); tone({ w: 'triangle', f: 700, f2: 180, t: 0.09, v: 0.22 }); },
+  split:  () => tone({ w: 'sawtooth', f: 980, f2: 220, t: 0.22, v: 0.18, vib: 35, vibR: 16 }),
+  mush:   () => noise({ t: 0.12, f: 1400, f2: 200, v: 0.22 }),
+  spider: () => tone({ w: 'square', f: 240, f2: 300, t: 0.18, v: 0.12, vib: 60, vibR: 22 }),
+  flea:   () => tone({ w: 'triangle', f: 1200, f2: 1900, t: 0.1, v: 0.14 }),
+  pop:    () => tone({ w: 'sine', f: 520, f2: 1040, t: 0.07, v: 0.22 }),
+  die:    () => { tone({ w: 'sawtooth', f: 520, f2: 40, t: 0.75, v: 0.3, vib: 40, vibR: 8 }); noise({ t: 0.6, f: 1500, f2: 100, v: 0.3 }); },
+  start:  () => { [0, 0.07, 0.14].forEach((d, i) => tone({ w: 'square', f: 392 * Math.pow(1.26, i), t: 0.12, v: 0.15, at: ctx().currentTime + d })); },
+  wave:   () => { [0, 0.09, 0.18, 0.27].forEach((d, i) => tone({ w: 'triangle', f: 523 * Math.pow(1.25, i), t: 0.2, v: 0.2, at: ctx().currentTime + d })); },
+  bonus:  () => { [0, 0.06, 0.12, 0.18, 0.24].forEach((d, i) => tone({ w: 'square', f: 660 * Math.pow(1.2, i), t: 0.1, v: 0.12, at: ctx().currentTime + d })); },
+  hurt:   () => tone({ w: 'square', f: 300, f2: 90, t: 0.3, v: 0.24, vib: 25, vibR: 12 }),
+  toggle: () => tone({ w: 'triangle', f: 700, f2: 1100, t: 0.06, v: 0.15 })
+};
+function sfx(name) { if (SFX[name]) SFX[name](); }
+
+// simple looping arpeggio music (optional, M toggles)
+const CHORDS = [[0, 3, 7, 12], [-2, 2, 5, 9], [-4, 0, 3, 7], [-5, -1, 2, 7]];
+let musStep = 0, nextNote = 0, musTimer = null;
+function musicTick() {
+  const c = ctx();
+  while (nextNote < c.currentTime + 0.2) {
+    const bar = Math.floor(musStep / 16) % 4;
+    const semi = CHORDS[bar][musStep % 4];
+    const f = 220 * Math.pow(2, semi / 12) * (musStep % 8 < 4 ? 2 : 4);
+    tone({ w: 'triangle', f, t: 0.11, v: 0.05, at: nextNote });
+    if (musStep % 8 === 0) tone({ w: 'sine', f: 110 * Math.pow(2, CHORDS[bar][0] / 12), t: 0.45, v: 0.09, at: nextNote });
+    nextNote += 0.125;
+    musStep++;
+  }
+}
+function setMusic(on) {
+  musOn = on;
+  if (on) {
+    ctx(); nextNote = ctx().currentTime + 0.05;
+    musTimer = setInterval(musicTick, 50);
+  } else if (musTimer) { clearInterval(musTimer); musTimer = null; }
+}
+
+// ---------- input ----------
+const keys = { L: 0, R: 0, U: 0, D: 0, Fire: 0 };
+const mouse = { x: W / 2, y: H - 60, active: false, fire: false };
+const CODE = {
+  ArrowLeft: 'L', KeyA: 'L', ArrowRight: 'R', KeyD: 'R', ArrowUp: 'U', KeyW: 'U',
+  ArrowDown: 'D', KeyS: 'D', Space: 'Fire'
+};
+addEventListener('keydown', e => {
+  const k = CODE[e.code];
+  if (k) { keys[k] = 1; e.preventDefault(); if (k === 'Fire' && state !== 'play') onAction(); }
+  if (e.code === 'Enter' || e.code === 'NumpadEnter') onAction();
+  if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
+  if (e.code === 'KeyM') { setMusic(!musOn); sfx('toggle'); }
+  if (e.code === 'KeyN') { sfxOn = !sfxOn; if (sfxOn) sfx('toggle'); }
+});
+addEventListener('keyup', e => { const k = CODE[e.code]; if (k) keys[k] = 0; });
+function toCanvas(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+cv.addEventListener('pointermove', e => {
+  const p = toCanvas(e); mouse.x = p.x; mouse.y = p.y; mouse.active = true;
+});
+cv.addEventListener('pointerdown', e => {
+  const p = toCanvas(e); mouse.x = p.x; mouse.y = p.y; mouse.active = true;
+  if (e.pointerType === 'touch') mouse.fire = true;
+  if (e.button === 0) { mouse.fire = true; onAction(); }
+});
+addEventListener('pointerup', () => { mouse.fire = false; });
+cv.addEventListener('pointerleave', () => { mouse.active = false; });
+
+// ---------- game state ----------
+let state = 'title';     // title | play | paused | over
+let score = 0, lives = 3, wave = 1, mult = 1, multT = 0, time = 0, bannerT = 0;
+let best = +(localStorage.getItem('cc_best') || 0);
+let hitStop = 0, shake = 0, flashA = 0;
+const player = { x: W / 2, y: H - 50, vx: 0, vy: 0, cool: 0, inv: 0, alive: true, respawn: 0, squash: 0, recoil: 0 };
+let bullets = [];        // {x,y,vy,trail:[]}
+let chains = [];         // centipedes: {n,hx,hy,dirx,vdir,drop,speed,trail}
+let mush = new Float32Array(COLS * ROWS);  // hp 0..4 per cell (0 = empty)
+let mushWob = new Float32Array(COLS * ROWS); // juice: hit wobble timer
+
+function mushHP(c, r) { return (c < 0 || c >= COLS || r < 0 || r >= ROWS) ? 0 : mush[r * COLS + c]; }
+function blockedX(x, y) {
+  return x < 10 || x > W - 10 || mushHP(Math.floor(x / CELL), Math.floor(y / CELL)) > 0;
+}
+function cellCenter(c, r) { return { x: c * CELL + CELL / 2, y: r * CELL + CELL / 2 }; }
+
+function fillMushrooms() {
+  mush.fill(0); mushWob.fill(0);
+  const dens = Math.min(0.22, 0.07 + wave * 0.012);
+  for (let r = 3; r < ROWS - 7; r++)
+    for (let c = 0; c < COLS; c++)
+      if (Math.random() < dens) mush[r * COLS + c] = 4;
+}
+
+// ---------- centipede chains ----------
+function makeChain(n, x, y, dirx, speed) {
+  const trail = [];
+  for (let k = n * SEG; k >= 0; k--) trail.push({ x: x - dirx * k, y });
+  return { n, hx: x, hy: y, dirx, vdir: 1, drop: 0, speed, trail, t0: rnd(0, 6) };
+}
+// segment centres: index 0 = head, following the trail by arc length
+function segPos(ch) {
+  const t = ch.trail, out = [t[t.length - 1]];
+  let i = t.length - 1, walked = 0;
+  for (let k = 1; k < ch.n; k++) {
+    const target = k * SEG;
+    while (i > 0) {
+      const a = t[i - 1], b = t[i];
+      const d = Math.hypot(a.x - b.x, a.y - b.y) || 0.0001;
+      if (walked + d >= target) {
+        const f = (target - walked) / d;
+        out.push({ x: b.x + (a.x - b.x) * f, y: b.y + (a.y - b.y) * f });
+        break;
+      }
+      walked += d; i--;
+    }
+    if (out.length <= k) out.push({ x: t[0].x, y: t[0].y });
+  }
+  return out;
+}
+function moveChain(ch, dt) {
+  const step = ch.speed * dt;
+  if (ch.drop > 0) {
+    const d = Math.min(ch.drop, 170 * dt);
+    ch.hy += d * ch.vdir; ch.drop -= d;
+  } else {
+    const probe = ch.hx + ch.dirx * (SEG * 0.5 + 2 + step);
+    if (blockedX(probe, ch.hy)) {
+      ch.dirx = -ch.dirx;
+      let ny = ch.hy + ch.vdir * CELL;
+      if (ny < 62 || ny > 440) { ch.vdir = -ch.vdir; ny = ch.hy + ch.vdir * CELL; }
+      if (mushHP(Math.floor(ch.hx / CELL), Math.floor(ny / CELL)) === 0) ch.drop = CELL;
+    } else {
+      ch.hx += ch.dirx * step;
+    }
+  }
+  const last = ch.trail[ch.trail.length - 1];
+  if (Math.abs(last.x - ch.hx) + Math.abs(last.y - ch.hy) >= 1) ch.trail.push({ x: ch.hx, y: ch.hy });
+  else { last.x = ch.hx; last.y = ch.hy; }
+  if (ch.trail.length > 800) ch.trail.splice(0, ch.trail.length - 800);
+}
+// ---------- particles & juice ----------
+let parts = [];
+function addP(o) { if (parts.length < 1000) parts.push(o); }
+function burst(x, y, n, c1, c2, sp) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, TAU), s = rnd(sp * 0.25, sp);
+    addP({ kind: Math.random() < 0.6 ? 'spark' : 'dot', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: rnd(0.3, 0.75), max: 0.75, c: Math.random() < 0.5 ? c1 : c2, s: rnd(2, 4.5), g: 180 });
+  }
+}
+function ring(x, y, c, r) { addP({ kind: 'ring', x, y, vx: 0, vy: 0, life: 0.45, max: 0.45, c, s: r }); }
+function hearts(x, y, c, n) {
+  for (let i = 0; i < n; i++)
+    addP({ kind: 'heart', x, y, vx: rnd(-60, 60), vy: rnd(-200, -110), life: rnd(0.8, 1.3), max: 1.3, c, s: rnd(5, 9), g: 90 });
+}
+function popText(x, y, txt, c) {
+  addP({ kind: 'text', x, y, vx: rnd(-15, 15), vy: -60, life: 0.9, max: 0.9, c, s: 16, txt });
+}
+function addScore(pts, x, y) {
+  mult = multT > 0 ? Math.min(8, mult + 1) : 1;
+  multT = 2.4;
+  const p = pts * mult;
+  score += p;
+  popText(x, y - 8, '+' + p + (mult > 1 ? ' x' + mult : ''), PALS[palIdx].ac);
+}
+
+// ---------- palette / stage ----------
+let palIdx = 0;
+function setStage(w) {
+  palIdx = (w - 1) % PALS.length;
+  const P = PALS[palIdx];
+  return P;
+}
+
+// ---------- player ----------
+function tryFire() {
+  if (player.cool > 0 || bullets.length >= 3 || !player.alive) return;
+  bullets.push({ x: player.x, y: player.y - 18, vy: -780, trail: [] });
+  player.cool = 0.13; player.recoil = 1;
+  sfx('shoot');
+  burst(player.x, player.y - 18, 5, PALS[palIdx].ship, '#ffffff', 160);
+}
+function updatePlayer(dt) {
+  const p = player;
+  p.cool -= dt; p.inv -= dt; p.recoil = Math.max(0, p.recoil - dt * 6);
+  if (!p.alive) {
+    p.respawn -= dt;
+    if (p.respawn <= 0) {
+      if (lives <= 0) { gameOver(); return; }
+      p.alive = true; p.x = W / 2; p.y = H - 50; p.vx = p.vy = 0; p.inv = 2;
+    }
+    return;
+  }
+  const ix = keys.R - keys.L, iy = keys.D - keys.U;
+  if (ix || iy) {
+    mouse.active = false;
+    p.vx += ix * 2600 * dt; p.vy += iy * 2200 * dt;
+  } else if (mouse.active) {
+    p.vx += ((mouse.x - p.x) * 60 - p.vx * 10) * dt;
+    p.vy += ((mouse.y - p.y) * 60 - p.vy * 10) * dt;
+  }
+  const damp = Math.exp(-(ix || iy ? 7 : 3) * dt);
+  p.vx *= damp; p.vy *= damp;
+  const sp = Math.hypot(p.vx, p.vy);
+  if (sp > 640) { p.vx *= 640 / sp; p.vy *= 640 / sp; }
+  p.x = clamp(p.x + p.vx * dt, 20, W - 20);
+  p.y = clamp(p.y + p.vy * dt, 400, H - 24);
+  p.squash = lerp(p.squash, clamp(sp / 500, 0, 0.35), Math.min(1, dt * 10));
+  if (sp > 170 && Math.random() < 0.18) addP({ kind: 'dot', x: p.x - p.vx * 0.03, y: p.y + 12, vx: rnd(-20, 20), vy: rnd(60, 120), life: 0.2, max: 0.2, c: PALS[palIdx].ship, s: rnd(2, 4), g: 0 });
+  if (keys.Fire || (mouse.fire)) tryFire();
+}
+function killPlayer() {
+  if (!player.alive || player.inv > 0) return;
+  lives--;
+  shake = 0.7; hitStop = 0.12; flashA = 0.5;
+  burst(player.x, player.y, 34, PALS[palIdx].ship, PALS[palIdx].head, 420);
+  ring(player.x, player.y, '#ffffff', 90);
+  sfx('die');
+  player.alive = false; player.respawn = lives <= 0 ? 2.2 : 1.5;
+  mult = 1; multT = 0;
+}
+
+// ---------- bullets & mushrooms ----------
+function hitMushroom(c, r, dmg) {
+  const i = r * COLS + c;
+  if (mush[i] <= 0) return false;
+  mush[i] = Math.max(0, mush[i] - dmg);
+  mushWob[i] = 0.25;
+  const p = cellCenter(c, r);
+  if (mush[i] === 0) { burst(p.x, p.y, 16, PALS[palIdx].mush[0], '#ffffff', 260); sfx('mush'); ring(p.x, p.y, PALS[palIdx].mush[1], 22); addScore(1, p.x, p.y); }
+  else { burst(p.x, p.y, 5, PALS[palIdx].mush[2], '#ffffff', 140); sfx('pop'); }
+  return true;
+}
+function spawnMushroom(x, y) {
+  const c = Math.floor(x / CELL), r = Math.floor(y / CELL);
+  if (c < 0 || c >= COLS || r < 1 || r >= ROWS - 7) return;
+  mush[r * COLS + c] = 4; mushWob[r * COLS + c] = 0.35;
+}
+
+// split a chain at segment idx (killed); left part keeps 0..idx-1, right part becomes a new chain
+function splitChain(ci, idx) {
+  const ch = chains[ci], pos = ch.pos;
+  const right = ch.n - idx - 1;
+  ch.n = idx;
+  if (right > 0) {
+    const hp = pos[idx + 1];
+    const dx = pos[idx + 2] ? pos[idx + 1].x - pos[idx + 2].x : 0;
+    const dirx = dx > 0.3 ? 1 : dx < -0.3 ? -1 : ch.dirx;
+    const t = ch.trail;
+    let i = t.length - 1, walked = 0;
+    const target = (idx + 1) * SEG;
+    while (i > 0) {
+      const a = t[i - 1], b = t[i];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (walked + d >= target) break;
+      walked += d; i--;
+    }
+    const nt = t.slice(0, i + 1);
+    nt.push({ x: hp.x, y: hp.y });
+    const nc = { n: right, hx: hp.x, hy: hp.y, dirx, vdir: ch.vdir, drop: 0,
+      speed: Math.min(ch.speed * 1.08, 260), trail: nt, t0: rnd(0, 6) };
+    nc.pos = segPos(nc);   // positions now, so a later bullet this frame can hit it
+    chains.push(nc);
+  }
+  if (ch.n <= 0) chains.splice(ci, 1);
+  else ch.pos = segPos(ch);  // shortened body: no stale segments for bullets later this frame
+}
+function hitSegment(ci, idx) {
+  const ch = chains[ci], p = ch.pos[idx];
+  const isHead = idx === 0;
+  const pal = PALS[palIdx];
+  addScore(isHead ? 100 : 10, p.x, p.y);
+  burst(p.x, p.y, isHead ? 26 : 14, isHead ? pal.head : pal.body, pal.body2, isHead ? 380 : 300);
+  ring(p.x, p.y, pal.body2, isHead ? 46 : 30);
+  if (Math.random() < 0.5 || isHead) hearts(p.x, p.y, pal.body, 1);
+  spawnMushroom(p.x, p.y);
+  if (ch.n <= 1) shake = 0.6; // only the final kill of a centipede shakes
+  hitStop = Math.max(hitStop, isHead ? 0.06 : 0.03);
+  sfx(isHead ? 'split' : 'hit');
+  splitChain(ci, idx);
+}
+
+// ---------- spider & flea ----------
+let spider = null, flea = null, spiderT = 9, fleaT = 14;
+function spawnSpider() {
+  const fromLeft = Math.random() < 0.5;
+  spider = { x: fromLeft ? -30 : W + 30, y: rnd(360, 420), t: 0, dir: fromLeft ? 1 : -1, sp: 150 + wave * 8, hp: 1, base: 0, eat: 0 };
+  spider.base = spider.y;
+  sfx('spider');
+}
+function spawnFlea() {
+  flea = { x: rnd(40, W - 40), y: -12, vy: 230 + wave * 12, last: -1 };
+  sfx('flea');
+}
+function updateSpiderFlea(dt) {
+  if (spider) {
+    const s = spider;
+    s.t += dt;
+    s.x += s.dir * s.sp * dt;
+    s.y = s.base + Math.sin(s.t * 5) * 45;
+    s.eat -= dt;
+    if (s.eat <= 0) {
+      const c = Math.floor(s.x / CELL), r = Math.floor(s.y / CELL);
+      if (mushHP(c, r) > 0) { mush[r * COLS + c] = 0; burst(s.x, s.y, 10, PALS[palIdx].spider, '#ffffff', 200); s.eat = 0.1; }
+    }
+    if (Math.random() < dt * 14) addP({ kind: 'dot', x: s.x, y: s.y + 12, vx: 0, vy: 40, life: 0.5, max: 0.5, c: PALS[palIdx].spider, s: 2.5, g: 0 });
+    if (s.x < -50 || s.x > W + 50) spider = null;
+    else if (Math.hypot(s.x - player.x, s.y - player.y) < 22) killPlayer();
+  } else if (state === 'play') {
+    spiderT -= dt;
+    if (spiderT <= 0) { spawnSpider(); spiderT = rnd(9, 14); }
+  }
+  if (flea) {
+    const f = flea;
+    f.y += f.vy * dt;
+    const row = Math.floor(f.y / CELL);
+    if (row !== f.last && row >= 1 && row < ROWS - 7) {
+      f.last = row;
+      const c = Math.floor(f.x / CELL);
+      if (mushHP(c, row) === 0 && Math.random() < 0.6) { mush[row * COLS + c] = 4; mushWob[row * COLS + c] = 0.3; }
+    }
+    if (Math.random() < dt * 30) addP({ kind: 'spark', x: f.x, y: f.y - 6, vx: rnd(-30, 30), vy: -40, life: 0.35, max: 0.35, c: '#ffffff', s: 2, g: 0 });
+    if (f.y > H + 20) flea = null;
+    else if (Math.hypot(f.x - player.x, f.y - player.y) < 20) killPlayer();
+  } else if (state === 'play' && wave >= 2) {
+    fleaT -= dt;
+    if (fleaT <= 0) { spawnFlea(); fleaT = rnd(10, 16); }
+  }
+}
+// ---------- update ----------
+function bulletVsChains(b) {
+  for (let ci = 0; ci < chains.length; ci++) {
+    const pos = chains[ci].pos;
+    for (let idx = 0; idx < pos.length; idx++) {
+      if (Math.hypot(pos[idx].x - b.x, pos[idx].y - b.y) < 12) { hitSegment(ci, idx); return true; }
+    }
+  }
+  return false;
+}
+function updateBullets(dt) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.trail.push({ x: b.x, y: b.y }); if (b.trail.length > 7) b.trail.shift();
+    b.y += b.vy * dt;
+    let dead = b.y < -10;
+    if (!dead && hitMushroom(Math.floor(b.x / CELL), Math.floor(b.y / CELL), 1)) dead = true;
+    if (!dead && spider && Math.hypot(b.x - spider.x, b.y - spider.y) < 24) {
+      addScore(300, spider.x, spider.y); burst(spider.x, spider.y, 40, PALS[palIdx].spider, '#ffffff', 420);
+      ring(spider.x, spider.y, PALS[palIdx].spider, 60); hearts(spider.x, spider.y, '#ffffff', 2);
+      sfx('bonus'); shake = 0.4; hitStop = 0.05; spider = null; dead = true;
+    }
+    if (!dead && flea && Math.hypot(b.x - flea.x, b.y - flea.y) < 18) {
+      addScore(200, flea.x, flea.y); burst(flea.x, flea.y, 26, '#ffffff', PALS[palIdx].mush[0], 340);
+      sfx('bonus'); flea = null; dead = true;
+    }
+    if (!dead) dead = bulletVsChains(b);
+    if (dead) bullets.splice(i, 1);
+  }
+}
+function checkPlayerVsChains() {
+  if (!player.alive || player.inv > 0) return;
+  for (const ch of chains)
+    for (const p of ch.pos)
+      if (Math.hypot(p.x - player.x, p.y - player.y) < 17) { killPlayer(); return; }
+}
+function updateParticles(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.life -= dt;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    const dr = Math.exp(-3 * dt);
+    p.vx *= dr; p.vy *= dr;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += (p.g || 0) * dt;
+  }
+  shake *= Math.exp(-8 * dt);
+  flashA *= Math.exp(-6 * dt);
+  for (let i = 0; i < mushWob.length; i++) if (mushWob[i] > 0) mushWob[i] = Math.max(0, mushWob[i] - dt);
+}
+function update(dt) {
+  if (bannerT > 0) bannerT -= dt;
+  if (multT > 0) { multT -= dt; if (multT <= 0) mult = 1; }
+  updatePlayer(dt);
+  if (state !== 'play') return;   // gameOver() may have run
+  if (chains.length === 0) { levelClear(dt); return; }
+  updateBullets(dt);
+  for (const ch of chains) { moveChain(ch, dt); ch.pos = segPos(ch); }
+  checkPlayerVsChains();
+  updateSpiderFlea(dt);
+}
+let clearT = 0;
+function levelClear(dt) {
+  if (clearT === 0) { nextWave(); clearT = 1.6; }
+  else { clearT -= dt; if (clearT <= 0) { clearT = 0; newLevel(); sfx('wave'); bannerT = 2.6; } }
+}
+function nextWave() {
+  wave++;
+  score += 500 + wave * 100;
+  popText(W / 2, H / 2 - 40, 'STAGE CLEAR  +' + (500 + wave * 100), PALS[palIdx].ac);
+  sfx('bonus');
+}
+function newLevel() {
+  setStage(wave);   // palette switches together with the new level, never over the old one
+  fillMushrooms();
+  bullets = [];
+  const n = Math.min(18, 8 + wave * 2), sp = Math.min(230, 70 + wave * 12);
+  chains = [makeChain(n, W - 20, 37.5, -1, sp)];
+  chains[0].pos = segPos(chains[0]);
+  spider = null; flea = null; spiderT = 7; fleaT = 12; clearT = 0;
+}
+
+// ---------- flow ----------
+function startGame() {
+  ctx();
+  state = 'play';
+  score = 0; lives = 3; wave = 1; mult = 1; multT = 0;
+  player.x = W / 2; player.y = H - 50; player.vx = player.vy = 0;
+  player.alive = true; player.inv = 2; player.respawn = 0;
+  parts = []; hitStop = 0;
+  setStage(1);
+  newLevel();
+  bannerT = 2.2;
+  sfx('start');
+}
+function gameOver() {
+  if (state !== 'play') return;
+  state = 'over';
+  overAt = time;
+  if (score > best) { best = score; try { localStorage.setItem('cc_best', best); } catch (e) {} }
+}
+function togglePause() {
+  if (state === 'play') { state = 'paused'; sfx('toggle'); }
+  else if (state === 'paused') { state = 'play'; sfx('toggle'); }
+}
+let overAt = 0;
+function onAction() {
+  if (state === 'title' || (state === 'over' && time - overAt > 0.9)) startGame();
+  else if (state === 'paused') togglePause();
+}
+// ---------- drawing: background ----------
+const blobs = Array.from({ length: 14 }, () => ({ x: rnd(0, W), y: rnd(0, H), r: rnd(40, 140), s: rnd(0.05, 0.2), p: rnd(0, TAU) }));
+function lerpPal(dt) {
+  const T = PALS[palIdx], k = 1 - Math.exp(-2.5 * dt);
+  for (const key of keysOfPal) cur[key] = mixC(cur[key], hx(T[key]), k);
+}
+function drawBG() {
+  const gr = g.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, rgb(cur.bgA)); gr.addColorStop(1, rgb(cur.bgB));
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'lighter';
+  for (const b of blobs) {
+    const x = b.x + Math.sin(time * b.s + b.p) * 40;
+    const y = (b.y + time * 48 * b.s) % (H + 280) - 140;
+    const rg = g.createRadialGradient(x, y, 0, x, y, b.r);
+    rg.addColorStop(0, rgb(cur.grid, 0.13)); rg.addColorStop(1, rgb(cur.grid, 0));
+    g.fillStyle = rg; g.fillRect(x - b.r, y - b.r, b.r * 2, b.r * 2);
+  }
+  g.globalCompositeOperation = 'source-over';
+  g.strokeStyle = rgb(cur.grid, 0.16); g.lineWidth = 1;
+  const off = (time * 40) % CELL;
+  g.beginPath();
+  for (let x = 0; x <= W; x += CELL) { g.moveTo(x + 0.5, 0); g.lineTo(x + 0.5, H); }
+  for (let y = off; y <= H; y += CELL) { g.moveTo(0, y + 0.5); g.lineTo(W, y + 0.5); }
+  g.stroke();
+  const vg = g.createRadialGradient(W / 2, H / 2, H * 0.4, W / 2, H / 2, H * 0.85);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.45)');
+  g.fillStyle = vg; g.fillRect(0, 0, W, H);
+}
+
+// ---------- drawing: mushrooms ----------
+function drawMushrooms() {
+  const P = PALS[palIdx];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const i = r * COLS + c, hp = mush[i];
+    if (hp <= 0) continue;
+    const p = cellCenter(c, r), wob = mushWob[i];
+    const s = (0.6 + 0.1 * hp) * (1 + Math.sin(wob * 40) * wob * 1.5);
+    g.save(); g.translate(p.x, p.y + 4); g.scale(s, s);
+    g.fillStyle = '#fff4e0'; g.fillRect(-4, -2, 8, 10);
+    g.fillStyle = P.mush[(r * 7 + c * 3) % 4];
+    g.beginPath(); g.ellipse(0, -2, 11, 9, 0, Math.PI, TAU); g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.85)';
+    g.beginPath(); g.arc(-4, -6, 2, 0, TAU); g.arc(3, -7, 1.6, 0, TAU); g.fill();
+    if (hp < 4) { g.strokeStyle = 'rgba(0,0,0,0.35)'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(-2, -9); g.lineTo(1, -4); g.lineTo(-1, -1); g.stroke(); }
+    g.fillStyle = '#2a1030';
+    g.beginPath(); g.arc(-2, 3, 1, 0, TAU); g.arc(2, 3, 1, 0, TAU); g.fill();
+    g.restore();
+  }
+}
+
+// ---------- drawing: centipede (wiggly tube, legs, cute head) ----------
+function drawChain(ch) {
+  const P = PALS[palIdx], pos = ch.pos, n = pos.length;
+  if (n === 0) return;
+  const pts = [], rads = [];
+  for (let k = 0; k < n; k++) {
+    const a = pos[Math.max(0, k - 1)], b = pos[Math.min(n - 1, k + 1)];
+    let tx = b.x - a.x, ty = b.y - a.y; const L = Math.hypot(tx, ty) || 1; tx /= L; ty /= L;
+    const wig = Math.sin(time * 11 - k * 0.75 + ch.t0) * (3.5 + Math.min(k, 6) * 0.4);
+    pts.push({ x: pos[k].x - ty * wig, y: pos[k].y + tx * wig, tx, ty });
+    rads.push((k === 0 ? 11.5 : 9.5) * (1 + 0.09 * Math.sin(time * 14 - k * 1.1)));
+  }
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  // legs
+  g.strokeStyle = P.body2; g.lineWidth = 2.2;
+  for (let k = 1; k < n - 1; k++) {
+    const p = pts[k];
+    for (const side of [-1, 1]) {
+      const px = -p.ty * side, py = p.tx * side;
+      const st = Math.sin(time * 18 + k * 1.3 + side * 1.6);
+      const bx = p.x + px * rads[k] * 0.6, by = p.y + py * rads[k] * 0.6;
+      g.beginPath(); g.moveTo(bx, by);
+      g.lineTo(bx + px * (10 + st * 3) + p.tx * st * 5, by + py * (10 + st * 3) + p.ty * st * 5);
+      g.stroke();
+    }
+  }
+  // body tube
+  for (let k = n - 1; k > 0; k--) {
+    g.strokeStyle = k % 2 ? P.body : P.body2;
+    g.lineWidth = rads[k] + rads[k - 1];
+    g.beginPath(); g.moveTo(pts[k].x, pts[k].y); g.lineTo(pts[k - 1].x, pts[k - 1].y); g.stroke();
+  }
+  // segment balls with highlight
+  for (let k = n - 1; k >= 0; k--) {
+    const p = pts[k], r = rads[k];
+    g.fillStyle = k === 0 ? P.head : k % 2 ? P.body : P.body2;
+    g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.45)';
+    g.beginPath(); g.arc(p.x - r * 0.3, p.y - r * 0.35, r * 0.33, 0, TAU); g.fill();
+  }
+  // head: antennae, eyes, blush, mouth
+  const h = pts[0], d = ch.dirx;
+  g.strokeStyle = P.head; g.lineWidth = 2;
+  for (const side of [-1, 1]) {
+    const bx = h.x + d * 4 + side * 3, by = h.y - 8;
+    const w = Math.sin(time * 9 + side) * 5;
+    g.beginPath(); g.moveTo(bx, by);
+    g.quadraticCurveTo(bx + d * 6 + side * 2, by - 10, bx + d * 10 + w + side * 2, by - 12 + Math.abs(w) * 0.3);
+    g.stroke();
+    g.fillStyle = P.head; g.beginPath(); g.arc(bx + d * 10 + w + side * 2, by - 12 + Math.abs(w) * 0.3, 2.4, 0, TAU); g.fill();
+  }
+  const ex = h.x + d * 3, ey = h.y - 2;
+  const blink = (time % 3.4) < 0.12;
+  g.fillStyle = '#ffffff';
+  for (const side of [-1, 1]) {
+    g.beginPath(); g.ellipse(ex + side * 4, ey, 3.2, blink ? 0.6 : 3.8, 0, 0, TAU); g.fill();
+  }
+  if (!blink) {
+    g.fillStyle = '#2a1030';
+    for (const side of [-1, 1]) { g.beginPath(); g.arc(ex + side * 4 + d * 1.2, ey + 0.5, 1.7, 0, TAU); g.fill(); }
+  }
+  g.fillStyle = 'rgba(255,110,150,0.55)';
+  g.beginPath(); g.ellipse(h.x - 6, h.y + 4, 3, 2, 0, 0, TAU); g.ellipse(h.x + 6, h.y + 4, 3, 2, 0, 0, TAU); g.fill();
+  g.strokeStyle = '#2a1030'; g.lineWidth = 1.4;
+  g.beginPath(); g.arc(h.x + d * 1, h.y + 4, 2.4, 0.15, Math.PI - 0.15); g.stroke();
+}
+// ---------- drawing: player, enemies, bullets, particles ----------
+function drawPlayer() {
+  const p = player;
+  if (!p.alive) return;
+  if (p.inv > 0 && Math.floor(time * 16) % 2 === 0) return;   // blink while invulnerable
+  const P = PALS[palIdx];
+  const tilt = clamp(p.vx / 700, -0.35, 0.35);
+  const fl = 7 + Math.sin(time * 40) * 3 + Math.min(14, Math.abs(p.vy) * 0.03);
+  g.save();
+  g.translate(p.x, p.y - p.recoil * 4);
+  g.rotate(tilt);
+  g.scale(1 + p.squash * 0.6 + p.recoil * 0.08, 1 - p.squash * 0.5 - p.recoil * 0.05);
+  // thruster flame
+  g.fillStyle = 'rgba(255,200,90,0.85)';
+  g.beginPath(); g.ellipse(0, 15 + fl * 0.3, 5, fl, 0, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.9)';
+  g.beginPath(); g.ellipse(0, 14, 2.5, fl * 0.5, 0, 0, TAU); g.fill();
+  // body
+  g.fillStyle = P.ship;
+  g.beginPath(); g.ellipse(0, 0, 17, 14, 0, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.55)';
+  g.beginPath(); g.ellipse(-6, -7, 5, 2.8, -0.4, 0, TAU); g.fill();
+  // ears (cute), bobbing with speed
+  const bob = Math.sin(time * 10) * 1.5 - Math.abs(p.vx) * 0.01;
+  g.fillStyle = P.ship;
+  for (const s of [-1, 1]) { g.beginPath(); g.ellipse(s * 11, -12 + bob, 4, 7, s * 0.3, 0, TAU); g.fill(); }
+  // eyes look toward velocity
+  const lx = clamp(p.vx / 400, -1, 1) * 2.5;
+  g.fillStyle = '#ffffff';
+  for (const s of [-1, 1]) { g.beginPath(); g.arc(s * 5, -1, 3.6, 0, TAU); g.fill(); }
+  g.fillStyle = '#1a1030';
+  for (const s of [-1, 1]) { g.beginPath(); g.arc(s * 5 + lx, -0.5, 1.9, 0, TAU); g.fill(); }
+  g.fillStyle = 'rgba(255,110,150,0.6)';
+  g.beginPath(); g.ellipse(-10, 4, 3, 1.8, 0, 0, TAU); g.ellipse(10, 4, 3, 1.8, 0, 0, TAU); g.fill();
+  g.restore();
+}
+function drawSpider() {
+  if (!spider) return;
+  const s = spider, P = PALS[palIdx];
+  g.save(); g.translate(s.x, s.y);
+  g.strokeStyle = P.spider; g.lineWidth = 2;
+  for (let i = 0; i < 4; i++) for (const side of [-1, 1]) {
+    const ph = Math.sin(time * 20 + i * 1.2 + side) * 5;
+    const ang = (i - 1.5) * 0.45 * side;
+    g.beginPath(); g.moveTo(side * 4, 0);
+    g.lineTo(side * 16 + ph * 0.4, Math.sin(ang) * 14 + ph);
+    g.lineTo(side * 24, Math.sin(ang) * 22 + 8 + ph * 0.5);
+    g.stroke();
+  }
+  g.fillStyle = P.spider;
+  g.beginPath(); g.ellipse(0, 0, 11, 9, 0, 0, TAU); g.fill();
+  g.fillStyle = '#ffffff';
+  g.beginPath(); g.arc(-4, -2, 3, 0, TAU); g.arc(4, -2, 3, 0, TAU); g.fill();
+  g.fillStyle = '#1a1030';
+  g.beginPath(); g.arc(-4 + s.dir, -2, 1.5, 0, TAU); g.arc(4 + s.dir, -2, 1.5, 0, TAU); g.fill();
+  g.restore();
+}
+function drawFlea() {
+  if (!flea) return;
+  const f = flea;
+  g.save(); g.translate(f.x, f.y);
+  g.fillStyle = '#fff07a';
+  g.beginPath(); g.ellipse(0, 0, 7, 5 + Math.sin(time * 30) * 1, 0, 0, TAU); g.fill();
+  g.fillStyle = '#1a1030';
+  g.beginPath(); g.arc(-2, -1, 1.2, 0, TAU); g.arc(2, -1, 1.2, 0, TAU); g.fill();
+  g.restore();
+}
+function drawBullets() {
+  const P = PALS[palIdx];
+  g.globalCompositeOperation = 'lighter';
+  for (const b of bullets) {
+    const n = b.trail.length;
+    for (let i = 0; i < n; i++) {
+      const t = (i + 1) / (n + 1);
+      g.fillStyle = P.ship; g.globalAlpha = t * 0.5;
+      g.beginPath(); g.arc(b.trail[i].x, b.trail[i].y, 2 + t * 2, 0, TAU); g.fill();
+    }
+    g.globalAlpha = 1;
+    g.fillStyle = P.ship;
+    g.beginPath(); g.arc(b.x, b.y, 7, 0, TAU); g.fill();
+    g.fillStyle = '#ffffff';
+    g.beginPath(); g.ellipse(b.x, b.y, 2.4, 6, 0, 0, TAU); g.fill();
+  }
+  g.globalCompositeOperation = 'source-over';
+}
+function heartPath(x, y, s) {
+  g.beginPath();
+  g.moveTo(x, y + s * 0.5);
+  g.bezierCurveTo(x - s * 1.2, y - s * 0.2, x - s * 0.5, y - s * 1.2, x, y - s * 0.4);
+  g.bezierCurveTo(x + s * 0.5, y - s * 1.2, x + s * 1.2, y - s * 0.2, x, y + s * 0.5);
+  g.closePath();
+}
+function drawParts() {
+  g.globalCompositeOperation = 'lighter';
+  for (const p of parts) {
+    if (p.kind === 'text') continue;
+    const a = clamp(p.life / p.max, 0, 1);
+    g.globalAlpha = a;
+    if (p.kind === 'dot') {
+      g.fillStyle = p.c; g.beginPath(); g.arc(p.x, p.y, p.s * (0.4 + 0.6 * a), 0, TAU); g.fill();
+    } else if (p.kind === 'spark') {
+      g.strokeStyle = p.c; g.lineWidth = p.s * 0.7;
+      g.beginPath(); g.moveTo(p.x, p.y); g.lineTo(p.x - p.vx * 0.04, p.y - p.vy * 0.04); g.stroke();
+    } else if (p.kind === 'ring') {
+      g.strokeStyle = p.c; g.lineWidth = 1 + 3 * a;
+      g.beginPath(); g.arc(p.x, p.y, p.s * (1 - a) + 4, 0, TAU); g.stroke();
+    } else if (p.kind === 'heart') {
+      g.fillStyle = p.c; heartPath(p.x, p.y, p.s * (0.6 + 0.4 * a)); g.fill();
+    }
+  }
+  g.globalCompositeOperation = 'source-over';
+  g.globalAlpha = 1;
+  g.font = 'bold 16px system-ui, Segoe UI, Arial';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.shadowColor = 'rgba(0,0,0,0.6)'; g.shadowBlur = 4;
+  for (const p of parts) {
+    if (p.kind !== 'text') continue;
+    const a = clamp(p.life / p.max, 0, 1);
+    const sc = 1 + (1 - a) * 0.25;
+    g.globalAlpha = Math.min(1, a * 1.6);
+    g.save(); g.translate(p.x, p.y); g.scale(sc, sc);
+    g.fillStyle = p.c; g.fillText(p.txt, 0, 0);
+    g.restore();
+  }
+  g.shadowBlur = 0; g.globalAlpha = 1;
+  g.textAlign = 'left';
+}
+// ---------- HUD & overlays ----------
+function dimScreen(a) { g.fillStyle = 'rgba(8,4,16,' + a + ')'; g.fillRect(0, 0, W, H); }
+function drawHUD() {
+  const P = PALS[palIdx], dark = palIdx === 4;
+  g.save();
+  g.font = 'bold 20px system-ui, "Segoe UI", Arial';
+  g.textBaseline = 'middle';
+  g.shadowColor = 'rgba(0,0,0,0.5)'; g.shadowBlur = dark ? 0 : 6;
+  g.fillStyle = dark ? '#2b1830' : '#ffffff';
+  g.textAlign = 'left';
+  g.fillText('SCORE ' + String(score).padStart(6, '0'), 16, 22);
+  g.font = 'bold 14px system-ui, "Segoe UI", Arial';
+  g.fillText('BEST ' + best, 16, 44);
+  g.textAlign = 'right';
+  g.font = 'bold 16px system-ui, "Segoe UI", Arial';
+  g.fillText('STAGE ' + wave + '  \u00b7  ' + P.name, W - 16, 22);
+  g.fillStyle = P.body;
+  for (let i = 0; i < lives; i++) heartPath(W - 26 - i * 24, 44, 8), g.fill();
+  g.textAlign = 'left';
+  if (mult > 1) {
+    g.fillStyle = P.ac; g.font = 'bold 22px system-ui, Arial';
+    g.fillText('x' + mult, 16, 70);
+    g.fillStyle = 'rgba(255,255,255,0.25)'; g.fillRect(64, 63, 120, 8);
+    g.fillStyle = P.ac; g.fillRect(64, 63, 120 * clamp(multT / 2.4, 0, 1), 8);
+  }
+  g.restore();
+}
+function drawBanner() {
+  if (bannerT <= 0 || state !== 'play') return;
+  const P = PALS[palIdx];
+  const sl = Math.max(0, bannerT - 2.0) * 300;
+  g.save();
+  g.globalAlpha = Math.min(1, bannerT * 1.2);
+  g.translate(W / 2 + sl, H / 2 - 150);
+  g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(-400, -36, 800, 72);
+  g.fillStyle = P.ac; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold 34px system-ui, "Segoe UI", Arial';
+  g.fillText('STAGE ' + wave + '  \u2014  ' + P.name, 0, 0);
+  g.restore();
+}
+function drawTitle() {
+  dimScreen(0.45);
+  const P = PALS[palIdx], t = time, word = 'CENTI-CUTE';
+  g.save();
+  g.font = 'bold 76px system-ui, "Segoe UI", Arial';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  const chars = [...word], widths = chars.map(ch => g.measureText(ch).width);
+  const total = widths.reduce((a, b) => a + b, 0);
+  let x = W / 2 - total / 2;
+  chars.forEach((ch, i) => {
+    const y = H / 2 - 90 + Math.sin(t * 4 + i * 0.6) * 10;
+    g.save();
+    g.translate(x + widths[i] / 2, y);
+    g.rotate(Math.sin(t * 3 + i) * 0.08);
+    g.scale(1 + Math.sin(t * 4 + i) * 0.04, 1 + Math.sin(t * 4 + i) * 0.04);
+    g.shadowColor = P.grid; g.shadowBlur = 18;
+    g.fillStyle = i % 2 ? P.head : P.body;
+    g.fillText(ch, 0, 0);
+    g.restore();
+    x += widths[i];
+  });
+  g.shadowBlur = 0;
+  g.font = 'bold 24px system-ui, "Segoe UI", Arial';
+  g.fillStyle = '#ffffff';
+  if (Math.floor(t * 2) % 2 === 0) g.fillText('Press SPACE or click to start', W / 2, H / 2 - 10);
+  g.font = '15px system-ui, "Segoe UI", Arial';
+  g.fillStyle = 'rgba(255,255,255,0.8)';
+  g.fillText('Arrows / WASD move \u00b7 Space or click shoots \u00b7 Mouse seeks the pointer', W / 2, H / 2 + 26);
+  g.fillText('Shoot the centipede, dodge the spider and flea, and clear each stage', W / 2, H / 2 + 50);
+  PALS.forEach((Q, i) => {
+    const cx = W / 2 - 2 * 46 + i * 46;
+    g.fillStyle = Q.bgA; g.beginPath(); g.arc(cx, H / 2 + 100, 16, 0, TAU); g.fill();
+    g.fillStyle = Q.body; g.beginPath(); g.arc(cx + 8, H / 2 + 100 - 6, 6, 0, TAU); g.fill();
+  });
+  g.restore();
+}
+function drawOver() {
+  dimScreen(0.6);
+  g.save();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold 66px system-ui, "Segoe UI", Arial';
+  g.shadowColor = PALS[palIdx].body; g.shadowBlur = 20;
+  g.fillStyle = '#ffffff'; g.fillText('GAME OVER', W / 2, H / 2 - 70);
+  g.shadowBlur = 0;
+  g.font = 'bold 26px system-ui, "Segoe UI", Arial';
+  g.fillStyle = PALS[palIdx].ac;
+  g.fillText('Score ' + score, W / 2, H / 2 - 5);
+  g.fillText('Best ' + best + (score >= best && score > 0 ? '  \u2605 new best!' : ''), W / 2, H / 2 + 32);
+  if (time - overAt > 0.9 && Math.floor(time * 2) % 2 === 0) {
+    g.font = 'bold 20px system-ui, "Segoe UI", Arial'; g.fillStyle = '#ffffff';
+    g.fillText('Press SPACE or click to retry', W / 2, H / 2 + 90);
+  }
+  g.restore();
+}
+function drawPaused() {
+  dimScreen(0.45);
+  g.save();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = 'bold 56px system-ui, "Segoe UI", Arial'; g.fillStyle = '#ffffff';
+  g.fillText('PAUSED', W / 2, H / 2 - 10);
+  g.font = '18px system-ui, "Segoe UI", Arial'; g.fillStyle = 'rgba(255,255,255,0.8)';
+  g.fillText('P or Esc to resume', W / 2, H / 2 + 34);
+  g.restore();
+}
+
+// ---------- render & loop ----------
+function render() {
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.save();
+  const s = shake * 10;
+  g.translate((Math.random() * 2 - 1) * s, (Math.random() * 2 - 1) * s);
+  drawBG(); drawMushrooms();
+  for (const ch of chains) drawChain(ch);
+  drawSpider(); drawFlea(); drawBullets(); drawPlayer(); drawParts();
+  g.restore();
+  if (flashA > 0.01) { g.fillStyle = 'rgba(255,255,255,' + (flashA * 0.35).toFixed(3) + ')'; g.fillRect(0, 0, W, H); }
+  drawHUD(); drawBanner();
+  if (state === 'title') drawTitle();
+  else if (state === 'over') drawOver();
+  else if (state === 'paused') drawPaused();
+}
+let lastT = performance.now();
+function step(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  if (state === 'play') {
+    if (hitStop > 0) { hitStop -= dt; updateParticles(dt); }
+    else { time += dt; update(dt); updateParticles(dt); }
+  } else {
+    time += dt;
+    if (state === 'title') for (const ch of chains) { moveChain(ch, dt); ch.pos = segPos(ch); }  // attract mode
+    updateParticles(dt);
+  }
+  lerpPal(dt);
+  render();
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  try { step(now); } catch (err) { document.documentElement.dataset.err = String(err && err.stack || err); console.error(err); }
+}
+newLevel();
+state = 'title';
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
